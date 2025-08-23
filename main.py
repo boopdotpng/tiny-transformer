@@ -4,34 +4,33 @@ from tinygrad.helpers import trange
 import youtokentome as yttm
 from pathlib import Path
 import math
+import random
+from typing import Tuple
 
 N_CTX = 256 
-D_emb = 256
-D_head = 256
+D_emb = 128 
+D_head = 128 
 d_ff = 4 * D_emb
-n_layers = 6
+n_layers = 4
 
 NL = "<|nl|>"
 
-text_path = Path(__file__).parent / "shakespeare.txt"
-transformed_text_path = Path(__file__).parent / "shakespeare_transformed.txt"
-
 tiny_shakes_text_raw = (Path(__file__).parent / "shakespeare.txt").read_text("utf-8")
-tiny_shakes_text = tiny_shakes_text_raw.replace("\r\n", "\n").replace("\n", f" {NL} ")
-
-# train tokenizer on transformed text
-if not (Path(__file__).parent / "shakes.model").exists():
-  with open(transformed_text_path, "w", encoding="utf-8") as f:
-    f.write(tiny_shakes_text)
-  yttm.BPE.train(data=str(transformed_text_path), model="shakes.model", vocab_size=512)
-bpe = yttm.BPE(model=str(Path(__file__).parent / "shakes.model"))
+# since shakespeare.txt already uses NL tokens, use raw text directly
+tiny_shakes_text = tiny_shakes_text_raw
+model_path = Path(__file__).parent / "shakes.model"
+data_path = Path(__file__).parent / "shakespeare.txt"
+if not model_path.exists():
+  yttm.BPE.train(data=str(data_path), model=str(model_path), vocab_size=1024)
+bpe = yttm.BPE(model=str(model_path))
 
 class MLP:
   def __init__(self):
-    self.fc1 = nn.Linear(D_emb, d_ff)
-    self.fc2 = nn.Linear(d_ff, D_emb)
+    self.w1 = nn.Linear(D_emb, d_ff, bias=False)
+    self.w2 = nn.Linear(D_emb, d_ff, bias=False)
+    self.w3 = nn.Linear(d_ff, D_emb, bias=False)
   def __call__(self, x: Tensor) -> Tensor:
-    return self.fc2(self.fc1(x).gelu())
+    return self.w3(self.w1(x) * self.w2(x).sigmoid()).dropout(p=0.1)
 
 class SelfAttention:
   def __init__(self):
@@ -45,7 +44,7 @@ class SelfAttention:
     v = self.v(x) # all of shape (B, T, D_head)
 
     scores: Tensor = (q @ k.transpose(1,2)) * (1.0 / math.sqrt(D_head)) #  (B, T, T)
-    weights = scores.masked_fill(mask == 0, -1e9).softmax() # (B, T, T)
+    weights = scores.masked_fill(mask == 0, -1e9).softmax().dropout(p=0.1) # (B, T, T)
 
     return self.o(weights @ v) # (B, T, D_emb) same as input, so we can chain to next module
 
@@ -56,8 +55,8 @@ class Block:
     self.ln2 = nn.RMSNorm(D_emb)
     self.mlp = MLP()
   def __call__(self, x: Tensor, mask: Tensor) -> Tensor:
-    x = x + self.attn(self.ln1(x), mask)
-    x = x + self.mlp(self.ln2(x)) 
+    x += self.attn(self.ln1(x), mask).dropout(p=0.1)
+    x += self.mlp(self.ln2(x)).dropout(p=0.1)
     return x
 
 class Transformer: 
@@ -66,29 +65,29 @@ class Transformer:
     self.wpe = nn.Embedding(N_CTX, D_emb) # positional embeddings (learned, added to wte)
     self.blocks = [Block() for _ in range(n_layers)]
     self.ln_f = nn.RMSNorm(D_emb)
+    self.head_bias = Tensor.zeros((bpe.vocab_size(),), requires_grad=True)
   def __call__(self, token_ids: Tensor) -> Tensor:
     _, T = token_ids.shape
     pos = Tensor.arange(T).unsqueeze(0)
-    x = self.wte(token_ids) + self.wpe(pos)
+    x = (self.wte(token_ids) + self.wpe(pos)).dropout(p=0.1)
     mask = Tensor.tril(Tensor.ones((T,T))).unsqueeze(0) # (1, T, T)
     for blk in self.blocks: 
       x = blk(x, mask)
     x = self.ln_f(x) 
-    logits = x @ self.wte.weight.transpose(1,0)
+    logits = (x @ self.wte.weight.transpose(1,0)) + self.head_bias
     return logits
 
-def make_blocks(token_ids, block_size: int = 256, stride: int = 64) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-  X, y = [], []
-  for i in range(0, len(token_ids) - block_size -1, stride):
-    x = token_ids[i : i+block_size]
-    Y = token_ids[i+1 : i+block_size+1]
-    X.append(x)
-    y.append(Y)
-  num_samples = len(X)
-  train_size = int(num_samples * 0.9)
-  X_train, Y_train = X[:train_size], y[:train_size]
-  X_test,  Y_test  = X[train_size:], y[train_size:]
-  return Tensor(X_train), Tensor(Y_train), Tensor(X_test), Tensor(Y_test)
+def make_blocks(token_ids, block_size=256, test_frac=0.1, stride=64):
+  L = len(token_ids)
+  starts = list(range(0, L - block_size - 1, stride))
+  X = [token_ids[i:i+block_size] for i in starts]
+  y = [token_ids[i+1:i+block_size+1] for i in starts]
+  pairs = list(zip(X, y))
+  random.shuffle(pairs)
+  X, y = zip(*pairs)
+  split = int(len(X) * (1.0 - test_frac))
+  return Tensor(list(X[:split])), Tensor(list(y[:split])), Tensor(list(X[split:])), Tensor(list(y[split:]))
+
 
 def generate(epoch: int, prompt: str = "", max_tokens:int = 256, temperature: float = 1.0, top_k: int = 50):
   state_dict = nn.state.safe_load(f"checkpoints/model{epoch}.safetensors")
@@ -144,9 +143,7 @@ def generate(epoch: int, prompt: str = "", max_tokens:int = 256, temperature: fl
       ctx.append(next_id)
       generated_tokens.append(next_id)
       
-      full_text = bpe.decode([generated_tokens])[0]
-      
-      full_text = full_text.replace(NL, "\n")
+      full_text = ''.join(bpe.decode([generated_tokens])).replace(NL, "\n")
       
       new_text = full_text[last_decoded_len:]
       if new_text:
@@ -164,7 +161,20 @@ if __name__ == "__main__":
     exit()
 
   model = Transformer()
-  opt = nn.optim.Adam(nn.state.get_parameters(model))
+  
+  # print param count for fun
+  print("parameter count:", sum([p.numel() for p in nn.state.get_parameters(model)]))
+  
+  # need to skip weight decay on some parameters
+  all_params = nn.state.get_parameters(model)
+  no_wd = [v for k,v in nn.state.get_state_dict(model).items() if ("bias" in k) or ("ln" in k) or ("wte" in k) or ("wpe" in k)]
+  wd_params = [p for p in all_params if p not in set(no_wd)]
+  print(len(no_wd), len(wd_params))
+
+  opt_wd = nn.optim.AdamW(wd_params, lr=1e-4, b1=0.9, b2=0.95, weight_decay=0.01)
+  opt_no_wd = nn.optim.Adam(no_wd, lr=1e-4, b1=0.9, b2=0.95)
+  optimizer = nn.optim.OptimizerGroup(opt_wd, opt_no_wd)
+
   token_ids = bpe.encode([tiny_shakes_text], output_type=yttm.OutputType.ID)[0]
   X_train, Y_train, X_test, Y_test = make_blocks(token_ids)
   losses = []
@@ -172,10 +182,10 @@ if __name__ == "__main__":
   @TinyJit
   @Tensor.train()
   def train_step() -> Tensor:
-    opt.zero_grad()
+    optimizer.zero_grad()
     samples = Tensor.randint(128, high=X_train.shape[0])
     loss = model(X_train[samples]).sparse_categorical_crossentropy(Y_train[samples]).mean().backward()
-    return loss.realize(*opt.schedule_step())
+    return loss.realize(*optimizer.schedule_step())
 
   @TinyJit
   def get_test_acc() -> Tensor:
@@ -190,8 +200,8 @@ if __name__ == "__main__":
     losses.append(loss.item())
     if i%10 == 9:
       test_acc = get_test_acc().item()
-      state_dict = nn.state.get_state_dict(model)
     if i%100 == 99:
+      state_dict = nn.state.get_state_dict(model)
       nn.state.safe_save(state_dict, f"checkpoints/model{i}.safetensors")
     t.set_description(f"loss: {loss.item():6.2f} test_accuracy(ppl): {test_acc:.2f}")
 
