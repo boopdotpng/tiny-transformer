@@ -6,6 +6,7 @@ from pathlib import Path
 import math
 import random
 
+N_CTX = 256 
 D_emb = 192 
 N_HEADS = 6 
 D_head =  D_emb // N_HEADS
