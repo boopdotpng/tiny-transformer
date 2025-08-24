@@ -1,4 +1,5 @@
 checkpoints/
 shakes.model
-losses.txt
 plot.png
+
+*.txt
