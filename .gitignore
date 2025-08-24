@@ -1,5 +1,5 @@
 checkpoints/
-shakes.model
 plot.png
 
 *.txt
+shakes_sp.*
